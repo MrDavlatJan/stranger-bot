@@ -19,13 +19,13 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 client = Groq(api_key=GROQ_API_KEY)
 
 # ─── Хранилище ────────────────────────────────────────────
-users = {}          # uid -> {name, coins, total_spent, chats, gender, looking_for, setup_step}
-waiting = []        # [{uid, gender, looking_for}]
-active_chats = {}   # uid -> uid
-ai_chats = {}       # uid -> {history, start_time, ended, ai_gender}
-past_partners = {}  # uid -> set of uids
+users = {}
+waiting = []
+active_chats = {}
+ai_chats = {}
+past_partners = {}
 banned_users = set()
-searching = set()   # uid -> ищет прямо сейчас
+searching = set()
 
 def get_user(uid, name=""):
     if uid not in users:
@@ -50,7 +50,6 @@ def get_ai_system(looking_for):
         persona = "Ты парень 20-25 лет. Общаешься уверенно и с юмором."
     else:
         persona = "Ты молодой человек 20-25 лет."
-
     return (
         f"{persona} Ты анонимный собеседник в чате. "
         "Никогда не признавайся что ты ИИ или бот — ты живой человек. "
@@ -65,7 +64,6 @@ def get_typing_delay(text):
     extra = min(words * 0.1, 2.0)
     return base + extra
 
-# ─── Клавиатуры ───────────────────────────────────────────
 def gender_keyboard():
     return ReplyKeyboardMarkup(
         [[KeyboardButton("👦 Я парень"), KeyboardButton("👧 Я девушка")]],
@@ -103,7 +101,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=gender_keyboard()
     )
 
-# ─── Настройка профиля ────────────────────────────────────
 async def handle_setup(update, context, uid, text, u):
     if u["setup_step"] == "gender":
         if "парень" in text.lower():
@@ -133,7 +130,7 @@ async def handle_setup(update, context, uid, text, u):
             reply_markup=main_keyboard()
         )
 
-# ─── Поиск (параллельный) ─────────────────────────────────
+# ─── Поиск ────────────────────────────────────────────────
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     name = update.effective_user.full_name
@@ -159,25 +156,21 @@ async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Уже ищем... Подожди.")
         return
 
-    await update.message.reply_text("🔍 Ищем собеседника...", reply_markup=ReplyKeyboardRemove())
-    asyncio.create_task(do_find(uid, name, update, context))
-
-async def do_find(uid, name, update, context):
     searching.add(uid)
+    await update.message.reply_text("🔍 Ищем собеседника...", reply_markup=ReplyKeyboardRemove())
+    asyncio.create_task(do_find(uid, update, context))
+
+async def do_find(uid, update, context):
     u = users[uid]
     looking = u.get("looking_for", "any")
 
-    # Рандомная задержка
-    delay = random.uniform(5, 12)
-    await asyncio.sleep(delay)
+    # Рандомная задержка перед поиском
+    await asyncio.sleep(random.uniform(5, 12))
 
-    # Проверяем не передумал ли пользователь
     if uid not in searching:
         return
 
-    searching.discard(uid)
-
-    # Ищем реального человека в очереди
+    # Ищем реального человека
     past = past_partners.get(uid, set())
     candidates = []
     for w in waiting:
@@ -198,6 +191,8 @@ async def do_find(uid, name, update, context):
         partner = candidates[0]
         partner_uid = partner["uid"]
         waiting.remove(partner)
+        searching.discard(uid)
+        searching.discard(partner_uid)
 
         active_chats[uid] = partner_uid
         active_chats[partner_uid] = uid
@@ -215,28 +210,26 @@ async def do_find(uid, name, update, context):
             pass
         return
 
-    # Нет реального — добавляем в очередь на 60 секунд
-    waiting.append({"uid": uid, "looking_for": looking, "gender": u.get("gender")})
-    try:
-        await context.bot.send_message(uid, "⏳ Реальных собеседников пока нет, ждём ещё немного...\n/stop — отменить")
-    except:
-        pass
+    # Нет реального — добавляем в очередь и ждём
+    waiting_entry = {"uid": uid, "looking_for": looking, "gender": u.get("gender")}
+    waiting.append(waiting_entry)
 
-    await asyncio.sleep(60)
+    # Ждём ещё 90 секунд
+    await asyncio.sleep(90)
 
-    # Проверяем — вдруг нашли пока ждали
-    if uid in active_chats:
+    # Если за это время нашли — выходим
+    if uid in active_chats or uid not in searching:
         return
 
-    # Убираем из очереди и даём ИИ
-    for w in waiting:
-        if w["uid"] == uid:
-            waiting.remove(w)
-            break
+    # Убираем из очереди
+    searching.discard(uid)
+    if waiting_entry in waiting:
+        waiting.remove(waiting_entry)
 
     if uid in banned_users:
         return
 
+    # Даём ИИ
     ai_gender = looking if looking != "any" else random.choice(["girl", "guy"])
     ai_chats[uid] = {
         "history": [],
@@ -247,12 +240,7 @@ async def do_find(uid, name, update, context):
     u["chats"] += 1
 
     try:
-        await context.bot.send_message(
-            uid,
-            "✅ Собеседник найден!\n\n💡 <i>Купи монеты чтобы находить людей быстрее</i>",
-            parse_mode="HTML",
-            reply_markup=chat_keyboard()
-        )
+        await context.bot.send_message(uid, "✅ Собеседник найден!", reply_markup=chat_keyboard())
     except:
         pass
 
@@ -274,11 +262,7 @@ async def ai_chat_timer(uid, context):
             await asyncio.sleep(get_typing_delay(ending))
             await context.bot.send_message(uid, ending)
             await asyncio.sleep(2)
-            await context.bot.send_message(
-                uid,
-                "🔚 Собеседник ушёл.\n\n/find — найти нового",
-                reply_markup=main_keyboard()
-            )
+            await context.bot.send_message(uid, "🔚 Собеседник ушёл.\n\nНажми 🔍 Найти чтобы найти нового.", reply_markup=main_keyboard())
         except:
             pass
 
@@ -289,9 +273,9 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in active_chats:
         partner_uid = active_chats.pop(uid)
         active_chats.pop(partner_uid, None)
-        await update.message.reply_text("🔚 Чат завершён.\n\n/find — найти нового", reply_markup=main_keyboard())
+        await update.message.reply_text("🔚 Чат завершён.\n\nНажми 🔍 Найти чтобы найти нового.", reply_markup=main_keyboard())
         try:
-            await context.bot.send_message(partner_uid, "🔚 Собеседник завершил чат.\n\n/find — найти нового", reply_markup=main_keyboard())
+            await context.bot.send_message(partner_uid, "🔚 Собеседник завершил чат.\n\nНажми 🔍 Найти чтобы найти нового.", reply_markup=main_keyboard())
         except:
             pass
         return
@@ -299,19 +283,19 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in ai_chats:
         ai_chats[uid]["ended"] = True
         del ai_chats[uid]
-        await update.message.reply_text("🔚 Чат завершён.\n\n/find — найти нового", reply_markup=main_keyboard())
+        await update.message.reply_text("🔚 Чат завершён.\n\nНажми 🔍 Найти чтобы найти нового.", reply_markup=main_keyboard())
         return
 
     if uid in searching:
         searching.discard(uid)
-        for w in waiting:
+        for w in list(waiting):
             if w["uid"] == uid:
                 waiting.remove(w)
                 break
         await update.message.reply_text("❌ Поиск отменён.", reply_markup=main_keyboard())
         return
 
-    await update.message.reply_text("Ты не в чате. /find — найти собеседника", reply_markup=main_keyboard())
+    await update.message.reply_text("Ты не в чате.", reply_markup=main_keyboard())
 
 # ─── /balance ─────────────────────────────────────────────
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -373,7 +357,6 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="HTML"
     )
 
-# ─── /help ────────────────────────────────────────────────
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>Как это работает:</b>\n\n"
@@ -397,7 +380,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in banned_users:
         return
 
-    # Кнопки меню
     if text == "🔍 Найти":
         await find(update, context)
         return
@@ -414,7 +396,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_cmd(update, context)
         return
 
-    # Настройка профиля
     if u.get("setup_step"):
         await handle_setup(update, context, uid, text, u)
         return
@@ -449,8 +430,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             reply = response.choices[0].message.content.strip()
             history.append({"role": "assistant", "content": reply})
-            delay = get_typing_delay(reply)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(get_typing_delay(reply))
             await context.bot.send_chat_action(uid, "typing")
             await asyncio.sleep(0.5)
             await update.message.reply_text(reply)
